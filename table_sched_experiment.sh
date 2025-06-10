@@ -1,82 +1,115 @@
 #!/bin/bash
 
-# فعال کردن ماژول‌های لازم
-modprobe sched_trace 2>/dev/null
-sleep 1
+# ======================================================================
+# تنظیمات پایه
+# ======================================================================
+MAJOR_CYCLE=1000  # سیکل اصلی به میلی‌ثانیه
+OUTPUT_DIR="experiment_results"
+mkdir -p $OUTPUT_DIR
 
-# تنظیم پلاگین زمان‌بند به sched_static
-echo "sched_static" > /proc/litmus/sched_plugin
-sleep 1
+# ======================================================================
+# کامپایل تسک آزمایشی
+# ======================================================================
+cat << 'EOF' > td_task.c
+#include <litmus.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
-# ایجاد جدول زمان‌بندی اولیه (۲ کار)
-cat > /root/table_small.txt <<EOL
-0 10000000 0
-10000000 20000000 1
-EOL
+#define ms2ns(ms) ((ms) * 1000000LL)
 
-# بارگذاری جدول کوچک
-echo "بارگذاری جدول کوچک (۲ ردیف):"
-cat /root/table_small.txt > /proc/litmus/static
-sleep 1
+pid_t gettid() { return syscall(SYS_gettid); }
 
-# اجرای کارهای بلادرنگ
-echo "شروع کارها با جدول کوچک..."
-rtspin -p 0 -I 0 10000 20000 100 &
-PID1=$!
-rtspin -p 0 -I 1 10000 20000 100 &
-PID2=$!
+int main() {
+    lt_t start, now, next_cycle;
+    int job_count = 0;
+    const int MAX_JOBS = 10; // 10 اجرا برای هر آزمایش
+    const lt_t MAJOR = ms2ns(1000); // سیکل اصلی 1000ms
+    const lt_t WORK_PER_CYCLE = ms2ns(50); // 50ms کار در هر سیکل
 
-# منتظر ماندن برای اتمام کارها
-sleep 10
-kill $PID1 $PID2 2>/dev/null
-wait $PID1 $PID2 2>/dev/null
-echo "کارها با جدول کوچک تکمیل شد."
+    // تنظیم پارامترهای تسک بلادرنگ
+    if (set_rt_task_param(gettid(), 0, 0, 0) != 0) {
+        perror("set_rt_task_param failed");
+        return 1;
+    }
 
-# ایجاد جدول بزرگ‌تر (۴ کار)
-cat > /root/table_large.txt <<EOL
-0 5000000 0
-5000000 10000000 1
-10000000 15000000 0
-15000000 20000000 1
-EOL
+    // همگام‌سازی با شروع سیکل
+    start = litmus_clock();
+    next_cycle = ((start / MAJOR) + 1) * MAJOR;
+    lt_sleep_until(next_cycle);
 
-# بارگذاری جدول بزرگ
-echo "بارگذاری جدول بزرگ (۴ ردیف):"
-cat /root/table_large.txt > /proc/litmus/static
-sleep 1
+    while (job_count < MAX_JOBS) {
+        lt_t work_done = 0;
+        lt_t job_start = litmus_clock();
 
-# اجرای کارها با جدول بزرگ
-echo "شروع کارها با جدول بزرگ..."
-rtspin -p 0 -I 0 10000 20000 100 &
-PID1=$!
-rtspin -p 0 -I 1 10000 20000 100 &
-PID2=$!
+        printf("Job %d started at %llu ns\n", job_count, job_start);
+        fflush(stdout);
 
-# منتظر ماندن برای اتمام کارها
-sleep 10
-kill $PID1 $PID2 2>/dev/null
-wait $PID1 $PID2 2>/dev/null
-echo "کارها با جدول بزرگ تکمیل شد."
+        // اجرای کار به صورت قطعات 1ms
+        while (work_done < WORK_PER_CYCLE) {
+            lt_t seg_start = litmus_clock();
+            lt_t seg_duration = (WORK_PER_CYCLE - work_done) > ms2ns(1) ? 
+                                ms2ns(1) : (WORK_PER_CYCLE - work_done);
+            
+            // چرخه کاری
+            while (litmus_clock() - seg_start < seg_duration) {}
 
-# آزمایش اندازه جدول‌های بزرگ‌تر
-echo "آزمایش بارگذاری جدول‌های بزرگ‌تر:"
-for exponent in {1..8}; do
-    rows=$((2**$exponent))
-    echo "ایجاد جدول با $rows ردیف..."
+            work_done += seg_duration;
+            printf("  Segment at %llu: %llu ns done\n", seg_start, work_done);
+            fflush(stdout);
+        }
+
+        // خواب تا شروع سیکل بعدی
+        next_cycle = job_start + MAJOR;
+        lt_sleep_until(next_cycle);
+        job_count++;
+    }
+    return 0;
+}
+EOF
+
+gcc td_task.c -o td_task -llitmus
+
+# ======================================================================
+# آزمایش‌ها
+# ======================================================================
+run_experiment() {
+    exp_name=$1
+    slots=$2
+
+    echo "Running experiment: $exp_name"
+    setsched P-RES
+    resctl -d all  # حذف رزرویشن‌های قبلی
+
+    # ایجاد رزرویشن جدولی
+    resctl -n 1 -c 0 -t table-driven -m $MAJOR_CYCLE $slots
     
-    # تولید جدول به صورت پویا
-    echo -n "" > /root/table_$rows.txt
-    for ((i=0; i<$rows; i++)); do
-        start=$((i * 10000000))
-        end=$(( (i+1) * 10000000 ))
-        task=$((i % 2))
-        echo "$start $end $task" >> /root/table_$rows.txt
-    done
+    # اجرای تسک
+    rt_launch -r 1 -c 0 ./td_task > $OUTPUT_DIR/${exp_name}_output.log 2>&1
     
-    # اندازه‌گیری زمان بارگذاری
-    echo "زمان بارگذاری جدول $rows ردیف:"
-    time (cat /root/table_$rows.txt > /proc/litmus/static)
-    sleep 1
+    sleep 12 # زمان برای اجرای کامل تسک (10 سیکل)
+    resctl -d all
+    echo "Experiment $exp_name completed"
+}
+
+# آزمایش 1: یک اسلات
+run_experiment "single_slot" "'[0,50)'"
+
+# آزمایش 2: دو اسلات
+run_experiment "two_slots" "'[0,25)' '[500,525)'"
+
+# آزمایش 3: چهار اسلات
+run_experiment "four_slots" "'[0,12.5)' '[250,262.5)' '[500,512.5)' '[750,762.5)'"
+
+# ======================================================================
+# گزارش نتایج
+# ======================================================================
+echo -e "\n\n===== Experiment Results Summary ====="
+for exp in single_slot two_slots four_slots; do
+    echo -e "\nExperiment $exp:"
+    grep "Job started" $OUTPUT_DIR/${exp}_output.log | tail -n 2
+    grep "Segment at" $OUTPUT_DIR/${exp}_output.log | tail -n 5
 done
 
-echo "آزمایش‌ها تکمیل شد!"
+echo "Results saved to: $OUTPUT_DIR/"
